@@ -5,58 +5,57 @@ import {
   sedesPermitidasFromPases,
   sedeActivaPorFecha
 } from "../../src/utils/sedeHelper.js";
+import { parseWpClassList } from "../utils/wpClassParser.js";
+import axios from "axios";
 
 const router = Router();
 
 // Alias para compatibilidad con frontend
-router.get("/sessions", authRequired, async (req, res, next) => {
-  req.url = "/";
-  next();
+// Alias legacy para panel admin / frontend viejo
+router.get("/", authRequired, async (req, res) => {
+  req.url = "/agenda/sessions";
+  return router.handle(req, res);
 });
 
-/* ========================================================================
-   GET — AGENDA POR SEDE (PROTEGIDA, USERS + STAFF + ADMIN)
-========================================================================= */
-router.get("/", authRequired, async (req, res) => {
+// ✅ Alias real para sesiones
+router.get("/agenda/sessions", authRequired, async (req, res) => {
   try {
     const usuario = req.user;
-
-    // 👀 El backend espera req.user.pases
     const pases = usuario?.pases || [];
 
     const sedesPermitidasRaw = sedesPermitidasFromPases(pases);
     const sedesPermitidas = sedesPermitidasRaw.map(s => s.name);
 
     if (
-     (!sedesPermitidas || sedesPermitidas.length === 0) &&
-       usuario.rol !== "admin"
+      (!sedesPermitidas || sedesPermitidas.length === 0) &&
+      usuario.rol !== "admin"
     ) {
-        return res.status(403).json({ error: "No tienes acceso a ninguna sede." });
-      }
+      return res.status(403).json({ error: "No tienes acceso a ninguna sede." });
+    }
 
     let { sede } = req.query;
 
     if (sedesPermitidas.length === 1) {
-      // Solo una sede → fija automáticamente
       sede = sedesPermitidas[0];
-    } else {
-      // Varias sedes → puede elegir
-      if (!sede) {
-        const auto = sedeActivaPorFecha();
-        sede = auto?.name || sedesPermitidas[0];
-      }
-
-      // La sede elegida debe estar permitida
-      if (!sedesPermitidas.includes(sede)) {
-        return res.status(403).json({
-          error: `No tienes acceso a la sede solicitada: ${sede}`,
-        });
-      }
+    } else if (!sede) {
+      const auto = sedeActivaPorFecha();
+      sede = auto?.name || sedesPermitidas[0];
     }
 
+    const year = req.query.year
+  ? parseInt(req.query.year)
+  : new Date().getFullYear();
+
     const result = await pool.query(
-      "SELECT * FROM agenda WHERE sede = $1 ORDER BY start_at ASC",
-      [sede]
+      `
+      SELECT *,
+        COALESCE(year_override, year) AS year_final
+      FROM agenda
+      WHERE sede = $1
+        AND COALESCE(year_override, year) = $2
+      ORDER BY start_at ASC
+      `,
+      [sede, year]
     );
 
     const sessions = result.rows.map(s => ({
@@ -70,13 +69,13 @@ router.get("/", authRequired, async (req, res) => {
       dia: s.dia,
       speakerNombre: s.speaker_nombre || null,
       sede: s.sede,
+      year: s.year_final,
       checkIns: s.check_ins || [],
     }));
 
     res.json({ sessions });
-
   } catch (err) {
-    console.error("Agenda error:", err);
+    console.error("Agenda sessions error:", err);
     res.status(500).json({ error: "Error al obtener agenda" });
   }
 });
@@ -85,9 +84,9 @@ router.get("/", authRequired, async (req, res) => {
    GET — SESIÓN POR ID (STAFF/USER/ADMIN)
 ========================================================================= */
 router.get("/:id", authRequired, async (req, res) => {
-  const { id } = req.params;
-
   try {
+    const { id } = req.params;
+
     const result = await pool.query(
       "SELECT * FROM agenda WHERE id = $1",
       [id]
@@ -101,6 +100,84 @@ router.get("/:id", authRequired, async (req, res) => {
   } catch (err) {
     console.error("Agenda ID error:", err);
     res.status(500).json({ error: "Error al obtener sesión" });
+  }
+});
+
+/* importar sesiones desde WordPress  */
+router.post("/sync/wp", authRequired, async (req, res) => {
+  try {
+    if (!["admin", "staff"].includes(req.user.rol)) {
+      return res.status(403).json({ error: "Solo staff/admin" });
+    }
+
+    const WP_URL = "https://cmc-latam.com/wp-json/wp/v2/session?per_page=100";
+
+    const wpRes = await axios.get(WP_URL, {
+      headers: {
+        "User-Agent": "CMC-App/1.0",
+        "Accept": "application/json"
+      },
+      timeout: 10000
+    });
+
+    const wpSessions = wpRes.data;
+
+    let inserted = 0;
+    let skipped = 0;
+
+    for (const wp of wpSessions) {
+      const parsed = parseWpClassList(wp.class_list);
+
+      if (!parsed) {
+        skipped++;
+        continue;
+      }
+
+        await pool.query(
+          `
+          INSERT INTO agenda (
+            title,
+            description,
+            start_at,
+            end_at,
+            sede,
+            year,
+            tipo,
+            categoria,
+            external_source
+          )
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+          ON CONFLICT DO NOTHING
+          `,
+          [
+            wp.title.rendered,
+            wp.content.rendered,
+            wp.acf?.start_at || null,
+            wp.acf?.end_at || null,
+            parsed.sede,
+            parsed.year,
+            parsed.tipo,
+            parsed.tipo === "curso" ? "curso" : "sesion",
+            {
+              source: "wordpress",
+              wp_id: wp.id,
+              slug: wp.slug,
+              class_list: wp.class_list
+            }
+          ]
+        );
+
+        inserted++;
+      }
+
+    res.json({ ok: true, inserted, skipped });
+
+  } catch (err) {
+    console.error("WP sync error REAL:", err.message);
+    res.status(500).json({
+      error: "Error sincronizando WordPress",
+      detail: err.message
+    });
   }
 });
 
